@@ -186,7 +186,9 @@ async def shopify_check(cc, mm, yy, cvv, site):
             elif "payment" in result_url and "checkouts" in result_url:
                 return _ok("CARD_DECLINED", gateway, price, "False", "False", elapsed)
             else:
-                return _ok("UNKNOWN", gateway, price, "False", "False", elapsed)
+                # Debug: return URL + snippet to understand response
+                snippet = result_text[:200].replace("\n", " ").replace("\r", "")
+                return _ok(f"UNKNOWN|URL:{result_url[:80]}|HTML:{snippet}", gateway, price, "False", "False", elapsed)
 
     except asyncio.TimeoutError:
         return _err("TIMEOUT", start)
